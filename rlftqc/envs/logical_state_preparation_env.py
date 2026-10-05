@@ -51,7 +51,8 @@ class LogicalStatePreparationEnv(environment.Environment):
         max_steps = 50,
         threshold = 0.99,                 
         initialize_plus = [],
-        use_max_reward = True
+        use_max_reward = True,
+        cells = None,
         ):
         """Initialize a logical state preparation environment.
         Args:
@@ -131,7 +132,8 @@ class LogicalStatePreparationEnv(environment.Environment):
 
         ## Get observation shape and actions                                      
         self.obs_shape = self.get_observation(self.initial_tableau.current_tableau[0]).flatten().shape[0] + self.n_qubits_physical ## For the sign
-        self.actions = self.action_matrix()
+        self.cells = cells
+        self.actions = self.action_matrix_from_cells()
 
     def get_observation(self, tableau):
         """ Extract the check matrix for the observation of the RL agent.
@@ -145,51 +147,112 @@ class LogicalStatePreparationEnv(environment.Environment):
         check_mat = tableau[self.n_qubits_physical:].astype(jnp.uint8)
         return check_mat
 
-    def action_matrix(self,
-                      params: Optional[EnvParams] = EnvParams) -> chex.Array:
-        """ Generate the action matrix.
+    def one_qubit_gate(self, action_matrix, gate, n_qubit):
+        action_matrix.append(gate(n_qubit)[0])
+        self.sign_matrix.append(gate(n_qubit)[1])
+        self.sign_mask.append(0)
 
-        Args:
-            params (optional): Parameters of the environment
+        self.action_string.append('.%s(%d)' % (gate.__name__.lower(), n_qubit))
+        self.action_string_stim.append('.%s(%d)' % (gate.__name__.lower(), n_qubit))
+        self.action_string_stim_circ.append('.append("%s", [%d])' % (gate.__name__.lower(), n_qubit))
+
+        return action_matrix
+
+    def two_qubit_gate(self, action_matrix, gate, edge):
+        action_matrix.append(gate(edge[0], edge[1])[0])     
+        self.sign_matrix.append(gate(edge[0], edge[1])[1])
+
+        self.sign_mask.append(1)
+        self.action_string.append('.%s(%d, %d)' % (gate.__name__.lower(), edge[0], edge[1]))
+        self.action_string_stim.append('.%s(%d, %d)' % (gate.__name__.lower(), edge[0], edge[1]))
+        self.action_string_stim_circ.append('.append("%s", [%d, %d])' % (gate.__name__.lower(), edge[0], edge[1]))
+
+        return action_matrix
+
+    def action_matrix_from_cells(self):
+        """
+        Generate the action matrix from the grid cells and gates.
 
         Returns:
-            Action matrix for each gate.
+            Action matrix as a JAX array of uint8.
         """
         action_matrix = []
+        action_map = jnp.zeros((len(self.cells), 5), dtype=jnp.int32)  # NOTE: this is hardcoded to only have one single qubit gate and CNOTs
         self.action_string = []
         self.action_string_stim = []
         self.action_string_stim_circ = []
         self.sign_matrix = []
         self.sign_mask = []
+        
+        for i, cell in enumerate(self.cells):
+            for gate in self.gates:
+                measure_qubit = cell.measure_qubit
+                ## One qubit gate
+                if len(signature(gate).parameters) == 1:
+                        action_matrix = self.one_qubit_gate(action_matrix, gate, measure_qubit)
+                        action_map.at[i, 0].set(len(action_matrix) - 1)
 
-        for gate in self.gates:
-            ## One qubit gate
-            if len(signature(gate).parameters) == 1:
-                for n_qubit in range(self.n_qubits_physical):                    
-                    action_matrix.append(gate(n_qubit)[0])
-                    self.sign_matrix.append(gate(n_qubit)[1])                    
-                    self.sign_mask.append(0)
+                ## Two qubit gates
+                elif len(signature(gate).parameters) == 2:
+                    for j, data_qubit in enumerate(cell.data_qubits):
+                        if data_qubit is not None:
+                            action_matrix = self.two_qubit_gate(action_matrix, gate, (measure_qubit, data_qubit))
+                            action_map.at[i, j + 1].set(len(action_matrix) - 1)
+                        else: 
+                            action_map.at[i, j + 1].set(-1) #  should check later if you get any -1's, shouldn't occur
 
-
-                    self.action_string.append('%s-%d' % (gate.__name__, n_qubit))
-                    self.action_string_stim.append('.%s(%d)' % (gate.__name__.lower(), n_qubit))
-                    self.action_string_stim_circ.append('.append("%s", [%d])' % (gate.__name__.lower(), n_qubit))
-
-            ## Two qubit gates
-            elif len(signature(gate).parameters) == 2:
-                for edge in self.graph:
-                    action_matrix.append(gate(edge[0], edge[1])[0])     
-                    self.sign_matrix.append(gate(edge[0], edge[1])[1])
-
-                    self.sign_mask.append(1)
-                    self.action_string.append('%s-%d-%d' % (gate.__name__, edge[0], edge[1]))
-                    self.action_string_stim.append('.%s(%d, %d)' % (gate.__name__.lower(), edge[0], edge[1]))
-                    self.action_string_stim_circ.append('.append("%s", [%d, %d])' % (gate.__name__.lower(), edge[0], edge[1]))
-             
         self.sign_matrix = jnp.array(self.sign_matrix, dtype=jnp.uint8)
         self.sign_mask = jnp.array(self.sign_mask, dtype=jnp.uint8)
+        self.action_map = action_map
 
         return jnp.array(action_matrix, dtype=jnp.uint8)
+    
+
+    # def action_matrix(self,
+    #                   params: Optional[EnvParams] = EnvParams) -> chex.Array:
+    #     """ Generate the action matrix.
+
+    #     Args:
+    #         params (optional): Parameters of the environment
+
+    #     Returns:
+    #         Action matrix for each gate.
+    #     """
+    #     action_matrix = []
+    #     self.action_string = []
+    #     self.action_string_stim = []
+    #     self.action_string_stim_circ = []
+    #     self.sign_matrix = []
+    #     self.sign_mask = []
+
+    #     for gate in self.gates:
+    #         ## One qubit gate
+    #         if len(signature(gate).parameters) == 1:
+    #             for n_qubit in range(self.n_qubits_physical):                    
+    #                 action_matrix.append(gate(n_qubit)[0])
+    #                 self.sign_matrix.append(gate(n_qubit)[1])                    
+    #                 self.sign_mask.append(0)
+
+
+    #                 self.action_string.append('%s-%d' % (gate.__name__, n_qubit))
+    #                 self.action_string_stim.append('.%s(%d)' % (gate.__name__.lower(), n_qubit))
+    #                 self.action_string_stim_circ.append('.append("%s", [%d])' % (gate.__name__.lower(), n_qubit))
+
+    #         ## Two qubit gates
+    #         elif len(signature(gate).parameters) == 2:
+    #             for edge in self.graph:
+    #                 action_matrix.append(gate(edge[0], edge[1])[0])     
+    #                 self.sign_matrix.append(gate(edge[0], edge[1])[1])
+
+    #                 self.sign_mask.append(1)
+    #                 self.action_string.append('%s-%d-%d' % (gate.__name__, edge[0], edge[1]))
+    #                 self.action_string_stim.append('.%s(%d, %d)' % (gate.__name__.lower(), edge[0], edge[1]))
+    #                 self.action_string_stim_circ.append('.append("%s", [%d, %d])' % (gate.__name__.lower(), edge[0], edge[1]))
+             
+    #     self.sign_matrix = jnp.array(self.sign_matrix, dtype=jnp.uint8)
+    #     self.sign_mask = jnp.array(self.sign_mask, dtype=jnp.uint8)
+
+    #     return jnp.array(action_matrix, dtype=jnp.uint8)
   
     def hamming(self, vec1, vec2):
         """ Compute hamming distance of the tableau for the reward.
@@ -372,51 +435,71 @@ class LogicalStatePreparationEnv(environment.Environment):
         return returned_state[1], returned_state[2]
   
     def step_env(
-        self, key: chex.PRNGKey, state: EnvState, action: int, params: EnvParams
-        ) -> Tuple[chex.Array, EnvState, float, bool, dict]:
-        """Performs step transitions in the environment.
+        self,
+        key: chex.PRNGKey,
+        state: EnvState,
+        action: chex.Array,
+        params: EnvParams,
+    ) -> Tuple[chex.Array, EnvState, float, bool, dict]:
+        """Apply one local action per head as a single environment step.
 
-        Args:
-            key: Random key for Jax.
-            state: The current state.
-            action: The action to be applied.
-            params: Parameters.
-
-        Returns: 
-            new observation, new state, reward, done, information.
+        action: shape (12,), with candidate indices in 0..4.
+        self.action_map: shape (12, 5), containing global action indices.
         """
-    
-        # Update state
-        new_state = jnp.matmul(state.tableau, self.actions[action]) % 2
-        new_sign = self.update_signs(state.tableau, new_state, state.sign, action)
-        current_distance = self.get_distance(new_state, new_sign)
 
-        ## Compute complementary distance reward
-        reward = current_distance - state.previous_distance 
-        new_max_diff = jnp.max(jnp.array([0.0, state.max_diff - reward]))
-        reward_adapted = jnp.max(jnp.array([0.0, reward - state.max_diff]))
+        # Translate local candidate indices into global action indices.
+        action = jnp.asarray(action, dtype=jnp.int32)
+        global_actions = self.action_map[
+            jnp.arange(self.action_map.shape[0]), action
+        ]
 
-        state = EnvState( new_state, new_sign, current_distance, state.time + 1, new_max_diff)
+        def apply_action(carry, global_action):
+            tableau, sign = carry
 
-        # Evaluate termination conditions
-        done = self.is_terminal(state, params)
-        if self.use_max_reward:
+            new_tableau = jnp.matmul(
+                tableau, self.actions[global_action]
+            ) % 2
 
-            return (
-                jax.lax.stop_gradient(self.get_obs(state)),
-                jax.lax.stop_gradient(state),
-                reward_adapted,
-                done,
-                {"discount": self.discount(state, params), "max_reward": reward_adapted},
+            new_sign = self.update_signs(
+                tableau, new_tableau, sign, global_action
             )
-        else:
-            return (
-                jax.lax.stop_gradient(self.get_obs(state)),
-                jax.lax.stop_gradient(state),
-                reward,
-                done,
-                {"discount": self.discount(state, params), "max_reward": reward_adapted},
-            )
+
+            return (new_tableau, new_sign), None
+
+        # Each action uses the tableau and signs produced by the previous one.
+        (new_tableau, new_sign), _ = jax.lax.scan(
+            apply_action,
+            (state.tableau, state.sign),
+            global_actions,
+        )
+
+        current_distance = self.get_distance(new_tableau, new_sign)
+
+        # Compute reward after applying the complete action vector.
+        reward = current_distance - state.previous_distance
+        new_max_diff = jnp.maximum(0.0, state.max_diff - reward)
+        reward_adapted = jnp.maximum(0.0, reward - state.max_diff)
+
+        state = EnvState(
+            new_tableau,
+            new_sign,
+            current_distance,
+            state.time + 1,
+            new_max_diff,
+        )
+
+        done = self.is_terminated(state, params)
+
+        return (
+            jax.lax.stop_gradient(self.get_obs(state)),
+            jax.lax.stop_gradient(state),
+            reward_adapted if self.use_max_reward else reward,
+            done,
+            {
+                "discount": self.discount(state, params),
+                "max_reward": reward_adapted,
+            },
+        )
         
 
     def reset_env(
@@ -448,14 +531,14 @@ class LogicalStatePreparationEnv(environment.Environment):
         )
         return self.get_obs(state), state
 
-    def is_terminal(self, state: EnvState, params: EnvParams) -> bool:
-        """Check whether state is terminal.
+    def is_terminated(self, state: EnvState, params: EnvParams) -> bool:
+        """Check whether state is terminated.
         
         Args:
             state: The state.
             params: The parameters.
         
-        Return:
+        Returns:
             True if the distance is more than threshold or the time is more than max_steps.
         """
         # Check termination criteria
@@ -468,21 +551,22 @@ class LogicalStatePreparationEnv(environment.Environment):
 
         return done
 
-    def get_obs(self, state: EnvState, params: Optional[EnvParams] = EnvParams) -> chex.Array:
-        """Applies observation function to state.
+    def get_obs(self, state: EnvState, params: Optional[EnvParams] = None):
+        obs_tab, obs_sign = self.canonical_stabilizers(
+            self.get_observation(state.tableau),
+            state.sign[self.n_qubits_physical:] * 2,
+        )
+        print(f"obs_tab: {obs_tab.shape}, obs_sign: {obs_sign.shape}")
 
-        Args:
-            state: The state.
-            params: The parameters.
-        
-        Returns:
-            Observations by appending the tableau and the sign
-        """
-        obs_tab, obs_sign = self.canonical_stabilizers(self.get_observation(state.tableau), state.sign[self.n_qubits_physical:] * 2)
+        obs = {
+            "tableau": obs_tab,          # (n, 2*n)
+            "phases": obs_sign // 2,     # (n,)
+        }
+
         if self.use_max_reward:
-            return jnp.append(jnp.append(obs_tab.flatten(), obs_sign // 2), state.max_diff)
-        else:
-            return jnp.append(obs_tab.flatten(), obs_sign // 2) 
+            obs["max_diff"] = state.max_diff  # scalar
+
+        return obs
   
     def __str__(self):
         '''Text representation.'''

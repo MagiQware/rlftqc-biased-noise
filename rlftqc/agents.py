@@ -8,6 +8,7 @@ import jax
 from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
 import optax
 from flax.training.train_state import TrainState
+from rlftqc.envs.wrappers.tableau_to_grid_wrapper import TableauToGridWrapper
 
 """
 The code is taken from PureJaxRL library: https://github.com/luchris429/purejaxrl
@@ -27,47 +28,105 @@ class Transition(NamedTuple):
     info: jnp.ndarray
 
 
-class ActorCritic(nn.Module):
-    """ Actor Critic networks for the RL agents.
+import numpy as np
+import jax.numpy as jnp
+import flax.linen as nn
+import distrax
 
-    Taken from PureJaxRL library: https://github.com/luchris429/purejaxrl
-    """
-    action_dim: Sequence[int]
+from flax.linen.initializers import constant, orthogonal
+
+
+class ActorCritic(nn.Module):
+    num_heads: int = 8
+    num_candidates: int = 5
     activation: str = "relu"
+    action_mask: Any = None
 
     @nn.compact
-    def __call__(self, x):
-        hidden_node = 128
-        if self.activation == "relu":
-            activation = nn.relu
-        else:
-            activation = nn.tanh
-        actor_mean = nn.Dense(
-            hidden_node, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            hidden_node, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(actor_mean)
-        actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(actor_mean)
-        pi = distrax.Categorical(logits=actor_mean)
+    def __call__(self, obs):
+        activation = nn.relu if self.activation == "relu" else nn.tanh
 
-        critic = nn.Dense(
-            hidden_node, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        critic = activation(critic)
-        critic = nn.Dense(
-            hidden_node, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(critic)
-        critic = activation(critic)
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
+        # Leading dimensions may be absent or represent a batch.
+        grid = jnp.asarray(obs["grid"], dtype=jnp.float32)
+        phases = jnp.asarray(obs["phases"], dtype=jnp.float32)
+        max_diff = jnp.asarray(obs["max_diff"], dtype=jnp.float32)
+
+        # grid:        (..., 5, 5, 42)
+        # phases:      (..., 21)
+        # max_diff:    (...) or (..., 1)
+        # action_mask: (..., 12, 5)
+
+        # Shared CNN encoder.
+        x = grid
+        for i, channels in enumerate((32, 64)):
+            x = nn.Conv(
+                features=channels,
+                kernel_size=(3, 3),
+                padding="SAME",
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+                name=f"conv_{i}",
+            )(x)
+            x = activation(x)
+
+        # Flatten spatial and channel dimensions, preserving batch dimensions.
+        x = x.reshape(x.shape[:-3] + (-1,))
+
+        if max_diff.ndim == phases.ndim - 1:
+            max_diff = max_diff[..., None]
+
+        features = jnp.concatenate([x, phases, max_diff], axis=-1)
+
+        # Actor hidden layers.
+        actor = features
+        for i in range(2):
+            actor = nn.Dense(
+                128,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+                name=f"actor_hidden_{i}",
+            )(actor)
+            actor = activation(actor)
+
+        logits = nn.Dense(
+            self.num_heads * self.num_candidates,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0),
+            name="actor_logits",
+        )(actor)
+
+        logits = logits.reshape(
+            logits.shape[:-1] + (self.num_heads, self.num_candidates)
         )
 
-        return pi, jnp.squeeze(critic, axis=-1)
+        # Each head must have at least one valid candidate.
+        # Invalid candidates receive zero probability.
+        masked_logits = jnp.where(self.action_mask, logits, -jnp.inf)
+
+        pi = distrax.Independent(
+            distrax.Categorical(logits=masked_logits),
+            reinterpreted_batch_ndims=1,
+        )
+
+        # Critic: one value for the entire observation.
+        critic = features
+        for i in range(2):
+            critic = nn.Dense(
+                128,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+                name=f"critic_hidden_{i}",
+            )(critic)
+            critic = activation(critic)
+
+        value = nn.Dense(
+            1,
+            kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0),
+            name="critic_value",
+        )(critic)
+
+        return pi, jnp.squeeze(value, axis=-1)
 
 
 def make_train(config, env, env_params = None):
@@ -90,7 +149,8 @@ def make_train(config, env, env_params = None):
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
     #env, env_params = gymnax.make(config["ENV_NAME"])
-    env = FlattenObservationWrapper(env)
+    # env = FlattenObservationWrapper(env)
+    env = TableauToGridWrapper(env, mapping=config["MAPPING"], rows=config["ROWS"], cols=config["COLS"])
     env = LogWrapper(env)
 
     def linear_schedule(count):
@@ -99,11 +159,27 @@ def make_train(config, env, env_params = None):
 
     def train(rng):
 
+        # INIT ENV
+        rng, reset_key = jax.random.split(rng)
+        reset_rng = jax.random.split(reset_key, config["NUM_ENVS"])
+        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(
+            reset_rng, env_params
+        )
+
         # INIT NETWORK
-        network = ActorCritic(env.action_space(env_params).n, activation=config["ACTIVATION"])
+        network = ActorCritic(
+            num_heads=config["NUM_HEADS"],
+            num_candidates=5,
+            activation=config["ACTIVATION"],
+            action_mask=config["ACTION_MASK"],
+        )
+        rng, init_key = jax.random.split(rng)
+        network_params = network.init(init_key, obsv)
         rng, _rng = jax.random.split(rng)
-        init_x = jnp.zeros(env.observation_space(env_params).shape)
-        network_params = network.init(_rng, init_x)
+
+
+        # init_x = jnp.zeros(env.observation_space(env_params).shape)
+        # network_params = network.init(_rng, init_x)
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -118,9 +194,9 @@ def make_train(config, env, env_params = None):
         )
 
         # INIT ENV
-        rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+        # rng, _rng = jax.random.split(rng)
+        # reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+        # obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
 
         # TRAIN LOOP
         n = 10_000
@@ -139,9 +215,10 @@ def make_train(config, env, env_params = None):
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                obsv, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0,0,0,None))(
+                obsv, env_state, reward, terminated, truncated, info = jax.vmap(env.step, in_axes=(0,0,0,None))(
                     rng_step, env_state, action, env_params
                 )
+                done = terminated | truncated 
                 transition = Transition(
                     done, action, value, reward, log_prob, last_obs, info
                 )

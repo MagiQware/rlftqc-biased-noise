@@ -38,11 +38,14 @@ class LogicalStatePreparation:
         initialize_plus = [],
         use_max_reward = True,
         training_config = None,
-        seed = 42):
+        seed = 42,
+        cells=None,
+        action_mask=None, 
+        mapping=None):
         """ Initialize a logical state preparation task. """
 
         ## Initialize the environment
-        self.env = LogicalStatePreparationEnv(target, gates, graph, distance_metric, max_steps, threshold, initialize_plus, use_max_reward)
+        self.env = LogicalStatePreparationEnv(target, gates, graph, distance_metric, max_steps, threshold, initialize_plus, use_max_reward, cells=cells)
 
         self.seed = seed
 
@@ -65,6 +68,11 @@ class LogicalStatePreparation:
                 "ACTIVATION": "relu",
                 "ANNEAL_LR": True,
                 "NUM_AGENTS": 10,
+                "ACTION_MASK": action_mask,
+                "NUM_HEADS": len(cells),
+                "MAPPING": mapping, 
+                "ROWS": 5, 
+                "COLS": 5
             }
 
 
@@ -115,7 +123,7 @@ class LogicalStatePreparation:
             eval_env = self.env.copy()
 
             env_params = None
-            network = ActorCritic(eval_env.action_space().n, activation=self.training_config["ACTIVATION"])
+            network = ActorCritic(num_heads=self.training_config["NUM_HEADS"], num_candidates=5, activation=self.training_config["ACTIVATION"], action_mask=self.training_config["ACTION_MASK"])
             rng = jax.random.PRNGKey(self.seed)
             reset_rng = jax.random.split(rng, self.training_config["NUM_ENVS"])
             obsv, env_state = jax.vmap(eval_env.reset, in_axes=(0, None))(reset_rng, None)
