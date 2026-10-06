@@ -14,3 +14,4 @@ matplotlib
 more_itertools
 networkx
 cirq
+wandb

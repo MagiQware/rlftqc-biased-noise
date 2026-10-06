@@ -37,8 +37,8 @@ from flax.linen.initializers import constant, orthogonal
 
 
 class ActorCritic(nn.Module):
-    num_heads: int = 8
-    num_candidates: int = 5
+    num_heads: int
+    num_candidates: int
     activation: str = "relu"
     action_mask: Any = None
 
@@ -54,7 +54,7 @@ class ActorCritic(nn.Module):
         # grid:        (..., 5, 5, 42)
         # phases:      (..., 21)
         # max_diff:    (...) or (..., 1)
-        # action_mask: (..., 12, 5)
+        # action_mask: (num_heads, num_candidates)
 
         # Shared CNN encoder.
         x = grid
@@ -129,7 +129,7 @@ class ActorCritic(nn.Module):
         return pi, jnp.squeeze(value, axis=-1)
 
 
-def make_train(config, env, env_params = None):
+def make_train(config, env, env_params = None, episode_callback=None):
     """ Make train function. 
     The code is taken from PureJaxRL library: https://github.com/luchris429/purejaxrl
     
@@ -137,10 +137,19 @@ def make_train(config, env, env_params = None):
         config: configuration file for the training.
         env: the environment for training
         env_params: parameters of the environments.
+        episode_callback: Optional host function receiving completed-episode metrics
+            after each rollout, together with the agent and update indices.
 
     Returns:
         Training function.
     """
+
+    # Derive the policy shape from the environment, including every gate type.
+    config["NUM_HEADS"] = len(env.cells)
+    config["NUM_CANDIDATES"] = env.num_candidates
+    action_mask = env.resolve_action_mask(config.get("ACTION_MASK"))
+    if not np.asarray(action_mask).any(axis=-1).all():
+        raise ValueError("Each cell must have at least one available action.")
 
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -157,7 +166,7 @@ def make_train(config, env, env_params = None):
         frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
         return config["LR"] * frac
 
-    def train(rng):
+    def train(rng, agent_index=0):
 
         # INIT ENV
         rng, reset_key = jax.random.split(rng)
@@ -169,9 +178,9 @@ def make_train(config, env, env_params = None):
         # INIT NETWORK
         network = ActorCritic(
             num_heads=config["NUM_HEADS"],
-            num_candidates=5,
+            num_candidates=config["NUM_CANDIDATES"],
             activation=config["ACTIVATION"],
-            action_mask=config["ACTION_MASK"],
+            action_mask=action_mask,
         )
         rng, init_key = jax.random.split(rng)
         network_params = network.init(init_key, obsv)
@@ -201,7 +210,7 @@ def make_train(config, env, env_params = None):
         # TRAIN LOOP
         n = 10_000
                
-        def _update_step(runner_state, unused):
+        def _update_step(runner_state, update_index):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, rng = runner_state
@@ -343,15 +352,23 @@ def make_train(config, env, env_params = None):
             metric = traj_batch.info
             rng = update_state[-1]
 
+            if episode_callback is not None:
+                # An input/output callback preserves logging as a runtime side effect
+                # inside compiled scans. Unordered callbacks support vectorized agents.
+                jax.experimental.io_callback(
+                    episode_callback, None, agent_index, update_index,
+                    metric["returned_episode"], metric["returned_episode_returns"],
+                    metric["returned_episode_lengths"],
+                )
+
             runner_state = (train_state, env_state, last_obs, rng)
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, env_state, obsv, _rng)
         runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
+            _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )
         return {"runner_state": runner_state, "metrics": metric}
 
     return train
-

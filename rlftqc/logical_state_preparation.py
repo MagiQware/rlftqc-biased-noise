@@ -1,7 +1,9 @@
 from rlftqc.envs.logical_state_preparation_env import LogicalStatePreparationEnv
+from rlftqc.envs.wrappers.tableau_to_grid_wrapper import TableauToGridWrapper
 import os 
 import jax
-from rlftqc.agents import make_train, ActorCritic
+from rlftqc.agents import ActorCritic
+from rlftqc.training_tracking import run_training
 from rlftqc.utils import convert_stim_to_qiskit_circuit
 import time 
 import matplotlib.pyplot as plt
@@ -75,18 +77,30 @@ class LogicalStatePreparation:
                 "COLS": 5
             }
 
+        self.training_config["NUM_HEADS"] = len(self.env.cells)
+        self.training_config["NUM_CANDIDATES"] = self.env.num_candidates
+        # Store the supplied mask; resolve its location columns for this gate set.
+        # Keeping it separate avoids expanding a mask twice when widths coincide.
+        mask = action_mask if action_mask is not None else self.training_config.get("ACTION_MASK")
+        effective_mask = self.env.resolve_action_mask(mask)
+        if not np.asarray(effective_mask).any(axis=-1).all():
+            raise ValueError("Each cell must have at least one available action.")
+        self.training_config["ACTION_MASK"] = None if mask is None else np.asarray(mask, dtype=bool).tolist()
 
-    def train(self):
-        """ Training the agent. """
-        #### Training
-        rng = jax.random.PRNGKey(self.seed)
-        rngs = jax.random.split(rng, self.training_config['NUM_AGENTS'])
-        train_vjit = jax.jit(jax.vmap(make_train(self.training_config, self.env)))
-        t0 = time.perf_counter()
+
+    def train(self, wandb_options=None):
+        """Train agents, optionally logging episode rewards and lengths.
+
+        Args:
+            wandb_options: Optional dictionary passed to ``wandb.init``. For
+                example, {"project": "rlftqc-biased-noise", "mode": "offline"}.
+                Leave unset to train without Weights & Biases.
+        """
+        start_time = time.perf_counter()
         print("==== Training begin")
-        self.outs = jax.block_until_ready(train_vjit(rngs))
-        self.total_time = time.perf_counter() - t0
-        print("==== Training finished, time elapsed: %.5f s" % (self.total_time))
+        self.outs = run_training(self.training_config, self.env, self.seed, wandb_options)
+        self.total_time = time.perf_counter() - start_time
+        print("==== Training finished, time elapsed: %.5f s" % self.total_time)
 
     def run(self, results_folder_name=None):
         """ Run the trained agent.
@@ -123,10 +137,19 @@ class LogicalStatePreparation:
             eval_env = self.env.copy()
 
             env_params = None
-            network = ActorCritic(num_heads=self.training_config["NUM_HEADS"], num_candidates=5, activation=self.training_config["ACTIVATION"], action_mask=self.training_config["ACTION_MASK"])
+            network = ActorCritic(
+                num_heads=len(eval_env.cells),
+                num_candidates=eval_env.num_candidates,
+                activation=self.training_config["ACTIVATION"],
+                action_mask=eval_env.resolve_action_mask(self.training_config.get("ACTION_MASK")),
+            )
             rng = jax.random.PRNGKey(self.seed)
             reset_rng = jax.random.split(rng, self.training_config["NUM_ENVS"])
-            obsv, env_state = jax.vmap(eval_env.reset, in_axes=(0, None))(reset_rng, None)
+            eval_wrapper = TableauToGridWrapper(
+                eval_env, mapping=self.training_config["MAPPING"],
+                rows=self.training_config["ROWS"], cols=self.training_config["COLS"],
+            )
+            obsv, env_state = jax.vmap(eval_wrapper.reset, in_axes=(0, None))(reset_rng, None)
             
             done = False
             actions = []
@@ -135,14 +158,18 @@ class LogicalStatePreparation:
                 length += 1 
                 rng, _rng = jax.random.split(rng)
                 pi, value = network.apply(params_new, obsv)
-                action = jnp.argmax(nn.softmax(pi.logits), 1)
-                actions.append(int(action[0]))
+                action = pi.mode()
+                global_actions = np.asarray(eval_env.action_map)[
+                    np.arange(len(eval_env.cells)), np.asarray(action[0])
+                ]
+                actions.extend(int(index) for index in global_actions if index >= 0)
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, self.training_config["NUM_ENVS"])
-                obsv, env_state, reward, done, info = jax.vmap(eval_env.step, in_axes=(0,0,0,None))(
+                obsv, env_state, reward, terminated, truncated, info = jax.vmap(eval_wrapper.step, in_axes=(0,0,0,None))(
                     rng_step, env_state, action, env_params
                 )
+                done = terminated | truncated
             
             if length < eval_env.max_steps:
 
@@ -243,6 +270,4 @@ class LogicalStatePreparation:
 
         fig.savefig('%s/length.png' % (results_folder_name), format='png', bbox_inches='tight')
         plt.close()        
-
-
 

@@ -43,6 +43,8 @@ class LogicalStatePreparationEnv(environment.Environment):
         use_max_reward (boolean, optional): Whether to use MAX RL algorithm.
 
     """
+    action_locations = ("center", "north", "east", "south", "west")
+
     def __init__(self,
         target,       
         gates=None,   
@@ -171,13 +173,35 @@ class LogicalStatePreparationEnv(environment.Environment):
 
     def action_matrix_from_cells(self):
         """
-        Generate the action matrix from the grid cells and gates.
+        Generate gate matrices and a distinct map column per gate/location pair.
+
+        Columns follow gate-list order. Single-qubit gates use center; each
+        two-qubit gate uses north, east, south, west. action_candidates labels
+        those columns, and action_mask marks available choices in each cell.
 
         Returns:
             Action matrix as a JAX array of uint8.
         """
+        # Each gate has its own local choices: one center choice for a
+        # one-qubit gate, or one choice per direction for a two-qubit gate.
+        candidates = []
+        candidate_gates = []
+        for gate in self.gates:
+            arity = len(signature(gate).parameters)
+            if arity not in (1, 2):
+                raise ValueError(f"Unsupported gate arity for {gate.__name__}: {arity}")
+            locations = self.action_locations[:1] if arity == 1 else self.action_locations[1:]
+            for location in locations:
+                candidates.append((gate.__name__.lower(), location))
+                candidate_gates.append(gate)
+        if not candidates or len(set(candidates)) != len(candidates):
+            raise ValueError("Configure at least one gate, with unique gate names.")
+        self.action_candidates = tuple(candidates)
+        self.candidate_location_indices = tuple(
+            self.action_locations.index(location) for _, location in candidates
+        )
         action_matrix = []
-        action_map = jnp.zeros((len(self.cells), 5), dtype=jnp.int32)  # NOTE: this is hardcoded to only have one single qubit gate and CNOTs
+        action_map = jnp.full((len(self.cells), len(candidates)), -1, dtype=jnp.int32)
         self.action_string = []
         self.action_string_stim = []
         self.action_string_stim_circ = []
@@ -185,27 +209,53 @@ class LogicalStatePreparationEnv(environment.Environment):
         self.sign_mask = []
         
         for i, cell in enumerate(self.cells):
-            for gate in self.gates:
+            for choice, (gate, (_, location)) in enumerate(zip(candidate_gates, candidates)):
                 measure_qubit = cell.measure_qubit
-                ## One qubit gate
-                if len(signature(gate).parameters) == 1:
-                        action_matrix = self.one_qubit_gate(action_matrix, gate, measure_qubit)
-                        action_map.at[i, 0].set(len(action_matrix) - 1)
+                location_index = self.candidate_location_indices[choice]
+                if not cell.action_mask[location_index]:
+                    continue
+                if location == "center":
+                    action_matrix = self.one_qubit_gate(action_matrix, gate, measure_qubit)
+                else:
+                    data_qubit = getattr(cell.data_qubits, location)
+                    if data_qubit is None:
+                        continue
+                    action_matrix = self.two_qubit_gate(action_matrix, gate, (measure_qubit, data_qubit))
+                action_map = action_map.at[i, choice].set(len(action_matrix) - 1)
 
-                ## Two qubit gates
-                elif len(signature(gate).parameters) == 2:
-                    for j, data_qubit in enumerate(cell.data_qubits):
-                        if data_qubit is not None:
-                            action_matrix = self.two_qubit_gate(action_matrix, gate, (measure_qubit, data_qubit))
-                            action_map.at[i, j + 1].set(len(action_matrix) - 1)
-                        else: 
-                            action_map.at[i, j + 1].set(-1) #  should check later if you get any -1's, shouldn't occur
+        if not action_matrix:
+            raise ValueError("No gates are available in the configured cells.")
 
         self.sign_matrix = jnp.array(self.sign_matrix, dtype=jnp.uint8)
         self.sign_mask = jnp.array(self.sign_mask, dtype=jnp.uint8)
         self.action_map = action_map
+        self.action_mask = action_map >= 0
 
         return jnp.array(action_matrix, dtype=jnp.uint8)
+
+    @property
+    def num_candidates(self):
+        """Number of gate/location choices available to each cell head."""
+        return len(self.action_candidates)
+
+    def resolve_action_mask(self, mask=None):
+        """Combine availability with a location mask or a candidate mask.
+
+        Existing masks have one column per center/direction. These are expanded
+        to all gates at that location. Otherwise, accept one column per candidate.
+        When both widths match, interpret the input as a location mask.
+        """
+        if mask is None:
+            return self.action_mask
+        mask = jnp.asarray(mask, dtype=bool)
+        if mask.shape == (len(self.cells), len(self.action_locations)):
+            mask = mask[:, jnp.array(self.candidate_location_indices)]
+        elif mask.shape != self.action_map.shape:
+            raise ValueError(
+                f"Action mask must have shape {(len(self.cells), len(self.action_locations))} "
+                f"or {self.action_map.shape}; got {mask.shape}."
+            )
+        return self.action_mask & mask
     
 
     # def action_matrix(self,
@@ -443,8 +493,9 @@ class LogicalStatePreparationEnv(environment.Environment):
     ) -> Tuple[chex.Array, EnvState, float, bool, dict]:
         """Apply one local action per head as a single environment step.
 
-        action: shape (12,), with candidate indices in 0..4.
-        self.action_map: shape (12, 5), containing global action indices.
+        action: shape (len(self.cells),), with local candidate indices.
+        self.action_map: shape (len(self.cells), num_candidates), containing global action
+        indices, or -1 for missing boundary directions (skipped).
         """
 
         # Translate local candidate indices into global action indices.
@@ -454,17 +505,20 @@ class LogicalStatePreparationEnv(environment.Environment):
         ]
 
         def apply_action(carry, global_action):
-            tableau, sign = carry
+            def apply_gate(carry):
+                tableau, sign = carry
 
-            new_tableau = jnp.matmul(
-                tableau, self.actions[global_action]
-            ) % 2
+                new_tableau = jnp.matmul(
+                    tableau, self.actions[global_action]
+                ) % 2
 
-            new_sign = self.update_signs(
-                tableau, new_tableau, sign, global_action
-            )
+                new_sign = self.update_signs(
+                    tableau, new_tableau, sign, global_action
+                )
 
-            return (new_tableau, new_sign), None
+                return new_tableau, new_sign
+
+            return jax.lax.cond(global_action >= 0, apply_gate, lambda carry: carry, carry), None
 
         # Each action uses the tableau and signs produced by the previous one.
         (new_tableau, new_sign), _ = jax.lax.scan(
@@ -578,7 +632,7 @@ class LogicalStatePreparationEnv(environment.Environment):
 
     def copy(self):
         """ Copy environment. """
-        return LogicalStatePreparationEnv(self.target, self.gates, self.graph, self.distance_metric, self.max_steps, self.threshold, self.initialize_plus, self.use_max_reward)
+        return LogicalStatePreparationEnv(self.target, self.gates, self.graph, self.distance_metric, self.max_steps, self.threshold, self.initialize_plus, self.use_max_reward, cells=self.cells)
 
     @property
     def name(self) -> str:
@@ -587,14 +641,14 @@ class LogicalStatePreparationEnv(environment.Environment):
 
     @property
     def num_actions(self, params: Optional[EnvParams] = EnvParams) -> int:
-        """Number of actions possible in environment."""
+        """Number of registered global gate matrices (not choices per head)."""
         return self.actions.shape[0]
 
     def action_space(
         self, params: Optional[EnvParams] = EnvParams
-    ) -> spaces.Discrete:
-        """Action space of the environment."""
-        return spaces.Discrete(self.num_actions)
+    ) -> spaces.Tuple:
+        """One local categorical choice per cell; consult action_mask for availability."""
+        return spaces.Tuple([spaces.Discrete(self.num_candidates) for _ in self.cells])
 
     def observation_space(self, params: EnvParams) -> spaces.Box:
         """Observation space of the environment."""
@@ -617,5 +671,3 @@ class LogicalStatePreparationEnv(environment.Environment):
     def default_params(self) -> EnvParams:
         """ Default environment parameters. """
         return EnvParams()
-
-

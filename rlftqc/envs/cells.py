@@ -103,7 +103,7 @@ def get_target():
     n = 17
     logical_indices = [1, 4, 10]
     logical = 'I' * n
-    paulis = ['X', 'Z']
+    paulis = ['Z', 'X']
     for i,qubit in enumerate(logical_indices):
         logical = logical[:qubit] + paulis[i % len(paulis)] + logical[qubit+1:]
 
@@ -118,15 +118,15 @@ def get_target():
         for data_qubit, mask in zip([data_qubits.north, data_qubits.south], action_mask[[1,3]]):
             print(f"data_qubit: {data_qubit}, mask: {mask}")
             if mask:
-                stab = stab[:data_qubit] + 'Z' + stab[data_qubit+1:]
+                stab = stab[:data_qubit] + 'X' + stab[data_qubit+1:]
 
         for data_qubit, mask in zip([data_qubits.east, data_qubits.west], action_mask[[2, 4]]):
             print(f"data_qubit: {data_qubit}, mask: {mask}")
             if mask:
-                stab = stab[:data_qubit] + 'X' + stab[data_qubit+1:]
+                stab = stab[:data_qubit] + 'Z' + stab[data_qubit+1:]
 
         # measure qubit must get back positive X by measuring stabilizer
-        stab = stab[:measure_qubit] + 'X' + stab[measure_qubit+1:]
+        stab = stab[:measure_qubit] + 'Z' + stab[measure_qubit+1:]
         
         target.append(stab)
         print(f"stab for cell {i}: {stab}")
@@ -135,7 +135,7 @@ def get_target():
     for measure_qubit in measure_qubits:
         print(f"measure_qubit: {measure_qubit}")
         stabilizer = 'I' * n
-        stabilizer = stabilizer[:measure_qubit] + 'X' + stabilizer[measure_qubit+1:]
+        stabilizer = stabilizer[:measure_qubit] + 'Z' + stabilizer[measure_qubit+1:]
         target.append(stabilizer)
 
 

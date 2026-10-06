@@ -111,6 +111,48 @@ ftlsp.run()     ## Run the agent to get the circuit
 ```
 Refer to the notebook `notebooks/03 - Integrated Fault-Tolerant Logical State Preparation.ipynb` <a href="https://drive.google.com/file/d/12zTTrUSPTK0dRym5XTizm2ugcZsoeki8/view?usp=sharing" target="_blank"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
  for more advanced examples. 
+## Weights & Biases training tracking
+
+Enable tracking for the unmeasured-target training script:
+
+```bash
+# Authenticate once before uploading online training metrics.
+wandb login
+.venv312/bin/python scripts/train_unmeasured_target.py \
+    --wandb --wandb-project rlftqc-biased-noise --wandb-run-name target-training
+```
+
+Use `--wandb-entity YOUR_TEAM` to select a team, or add `--wandb-mode offline`
+to save tracking data locally without logging in. Tracking is off unless `--wandb`
+is supplied. Install the updated requirements, or install `wandb` in your training
+environment with `python -m pip install wandb`.
+
+All three trainer classes also accept tracking options directly, including from notebooks:
+
+```python
+# Pass these options to your existing trainer's train method.
+preparation_trainer.train(wandb_options={
+    "project": "rlftqc-biased-noise",
+    "name": "target-training",
+    "mode": "online",  # Use "offline" to save a local run without uploading.
+})
+```
+
+Each agent has separate `agents/0/episode_reward` and `agents/0/episode_steps`
+curves (and corresponding curves for other agent indices). Reward is the sum of
+rewards over a completed episode; steps count environment actions in that episode.
+Logging happens during training after each rollout. Only completed episodes are
+included, even when an episode spans multiple rollouts. The horizontal axis is
+`environment_steps`, counting transitions across parallel environments for that
+agent. Episodes finishing together share the same horizontal coordinate.
+
+The `mean_episode_reward`, `mean_episode_steps`, and `completed_episodes` metrics
+summarize each rollout. Rollouts with no completed episodes report only progress
+and a zero completion count. The run also records training settings and the random
+seed, and closes automatically when training exits. Offline runs can be uploaded
+later using `wandb sync PATH_TO_OFFLINE_RUN`, as described in the
+[Weights & Biases documentation](https://docs.wandb.ai/guides/track/log/).
+
 ## Circuit Examples
 
 Go to this <a href="https://owncloud.gwdg.de/index.php/s/OsfE9WuvTitJuZv" target="_blank">link</a> to see the circuit examples that the RL agent has synthesized for various tasks in PNG, stim, and Latex formats.
@@ -138,4 +180,3 @@ The code in this repository is released under the MIT License.
 [1] Chamberland, Christopher, and Michael E. Beverland. "Flag fault-tolerant error correction with arbitrary distance codes." Quantum 2 (2018): 53.
 
 [2] Nägele, Maximilian, Jan Olle, Thomas Fösel, Remmy Zen, and Florian Marquardt. "Tackling Decision Processes with Non-Cumulative Objectives using Reinforcement Learning." arXiv:2405.13609 (2024).
-

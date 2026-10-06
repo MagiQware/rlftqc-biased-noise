@@ -1,7 +1,8 @@
 from rlftqc.envs.ft_logical_state_preparation_env import FTLogicalStatePreparationEnv
 import os 
 import jax
-from rlftqc.agents import make_train, ActorCritic
+from rlftqc.agents import ActorCritic
+from rlftqc.training_tracking import run_training
 from rlftqc.utils import convert_stim_to_qiskit_circuit
 import time 
 import matplotlib.pyplot as plt
@@ -121,17 +122,19 @@ class FTLogicalStatePreparation:
                 "NUM_AGENTS": 10,
             }
 
-    def train(self):
-        """ Training the agent. """
-        #### Training
-        rng = jax.random.PRNGKey(self.seed)
-        rngs = jax.random.split(rng, self.training_config['NUM_AGENTS'])
-        train_vjit = jax.jit(jax.vmap(make_train(self.training_config, self.env)))
-        t0 = time.perf_counter()
+    def train(self, wandb_options=None):
+        """Train agents, optionally logging episode rewards and lengths.
+
+        Args:
+            wandb_options: Optional dictionary passed to ``wandb.init``. For
+                example, {"project": "rlftqc-biased-noise", "mode": "offline"}.
+                Leave unset to train without Weights & Biases.
+        """
+        start_time = time.perf_counter()
         print("==== Training begin")
-        self.outs = jax.block_until_ready(train_vjit(rngs))
-        self.total_time = time.perf_counter() - t0
-        print("==== Training finished, time elapsed: %.5f s" % (self.total_time))
+        self.outs = run_training(self.training_config, self.env, self.seed, wandb_options)
+        self.total_time = time.perf_counter() - start_time
+        print("==== Training finished, time elapsed: %.5f s" % self.total_time)
 
     def run(self, results_folder_name=None):
         """ Run the trained agent.
